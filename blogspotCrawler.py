@@ -131,7 +131,9 @@ class ProcessPagination:
     """
     def __init__(self, baseurl: str, destination: str, images_dir: str=None,
                  session: requests.Session=None, max_workers: int=None,
-                 date_from: date=None, date_to: date=None, limit: int=-1):
+                 date_from: date=None, date_to: date=None, limit: int=-1,
+                 downloadhtml: bool = False, downloadImages: bool=False
+                 ):
         self.baseurl = baseurl
         self.url = baseurl
         self.destination = destination
@@ -148,6 +150,8 @@ class ProcessPagination:
         self.stop_paging = False
         self.lastdone = JobInfo()
         self.remaining = {}
+        self.use_download_images = downloadImages
+        self.use_download_html = downloadhtml
 
         # Create the images folder up front so worker threads don't race on it.
         os.makedirs(self.images_dir, exist_ok=True)
@@ -232,17 +236,19 @@ class ProcessPagination:
                 and not self.in_date_range(pub):
             return True  # in range-terms "handled" (won't retry), but not saved
 
-        self.download_images(body, title, post_url, pub)
+        if self.use_download_images == True:
+            self.download_images(body, title, post_url, pub)
 
         # TODO: "Flatten" html and/or convert to Markdown
 
-        with open(fname, 'w+') as f:
-            print("---", file=f)
-            print("layout: default", file=f)
-            print("title:", title, file=f)
-            print("tags:", "[" + ",".join(tags) + "]", file=f)
-            print("---", file=f)
-            print(body, file=f)
+        if self.use_download_html == True:
+            with open(fname, 'w+') as f:
+                print("---", file=f)
+                print("layout: default", file=f)
+                print("title:", title, file=f)
+                print("tags:", "[" + ",".join(tags) + "]", file=f)
+                print("---", file=f)
+                print(body, file=f)
 
         # Stamp the post file with the post's date so it sorts alongside its
         # images by publication date.
@@ -526,6 +532,19 @@ def main():
         default=-1,
         help="Max number of posts to crawl (-1 = all posts within the date range)"
     )
+    parser.add_argument('--html',
+        dest='downloadhtml',
+        type=bool,
+        default=False,
+        help="Toggle the ability to download the html for posts"
+    )
+    parser.add_argument('--images',
+        dest='downloadImages',
+        type=bool,
+        default=True,
+        help="Toggle the ability to download the images for posts"
+    )
+
 
     args = parser.parse_args()
 
@@ -542,7 +561,9 @@ def main():
         max_workers=args.threads,
         date_from=args.date_from,
         date_to=args.date_to,
-        limit=args.limit)
+        limit=args.limit,
+        downloadhtml=args.downloadhtml,
+        downloadImages=args.downloadImages)
 
     def signal_handler(sig, frame):
         # TODO: Add 5 seconds timeout or something like
