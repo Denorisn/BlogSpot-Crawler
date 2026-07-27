@@ -7,6 +7,7 @@ import errno
 import time
 import re
 import mimetypes
+from datetime import date
 from urllib.parse import urlparse, urljoin
 
 import argparse
@@ -23,10 +24,11 @@ LOGIN_PROFILE = "~/.config/scripts/blogcrawl_profile"
 IMAGE_HOSTS = ("bp.blogspot.com", "blogger.googleusercontent.com", "googleusercontent.com")
 
 # Blogger encodes the requested size in the image URL, either as a path
-# segment (".../s320/img.jpg", ".../w400-h225/img.jpg") or as a suffix
-# ("...=s320", "...=w400-h225-no"). "s0" means the original, full-size image.
-_SIZE_PATH_RE = re.compile(r"/(s\d+|w\d+-h\d+|s\d+-c)(/)")
-_SIZE_SUFFIX_RE = re.compile(r"=(s\d+|w\d+-h\d+)(-[a-z0-9-]+)?$")
+# segment (".../s320/img.jpg", ".../w400-h225/img.jpg", ".../w72-h72-p-k-no-nu/img.jpg")
+# or as a suffix ("...=s320", "...=w400-h225-no"). The size may carry trailing
+# flags (-c, -p-k-no-nu, ...). "s0" means the original, full-size image.
+_SIZE_PATH_RE = re.compile(r"/(?:s\d+|w\d+-h\d+)(?:-[a-z0-9-]+)?/")
+_SIZE_SUFFIX_RE = re.compile(r"=(?:s\d+|w\d+-h\d+)(?:-[a-z0-9-]+)?$")
 
 # Characters that are illegal in Windows filenames.
 _ILLEGAL_FNAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -42,7 +44,7 @@ def is_image_host(url: str) -> bool:
 
 def to_fullsize_url(url: str) -> str:
     """Rewrites a Blogger image URL to request the original, full-size image."""
-    url = _SIZE_PATH_RE.sub(r"/s0\2", url)
+    url = _SIZE_PATH_RE.sub("/s0/", url)
     url = _SIZE_SUFFIX_RE.sub("=s0", url)
     return url
 
@@ -68,6 +70,55 @@ def guess_extension(url: str, content_type: str = "") -> str:
     return ".jpg"
 
 
+_ISO_DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+
+
+def _to_date(value: str):
+    """Extracts a datetime.date from an ISO-ish string, or None."""
+    if not value:
+        return None
+    m = _ISO_DATE_RE.search(value)
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def extract_published_date(scope):
+    """Best-effort published date for a post from a BS4 element/soup subtree.
+
+    Looks at schema.org (`itemprop="datePublished"`) and Blogger's classic
+    template markers (`abbr.published`, `time.published`, `.published`) in
+    priority order, reading a machine-readable attribute where present. Returns
+    a datetime.date or None when no parseable date is found.
+    """
+    if scope is None:
+        return None
+    selectors = ('[itemprop="datePublished"]', 'abbr.published',
+                 'time.published', 'time[datetime]', '.published')
+    for sel in selectors:
+        for el in scope.select(sel):
+            for attr in ("title", "datetime", "content"):
+                d = _to_date(el.get(attr))
+                if d:
+                    return d
+            d = _to_date(el.get_text())
+            if d:
+                return d
+    return None
+
+
+def parse_cli_date(value: str) -> date:
+    """argparse type: accepts YYYY-MM-DD and returns a datetime.date."""
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid date '{value}', expected YYYY-MM-DD")
+
+
 @dataclass
 class JobInfo:
     """Saves info from a job
@@ -80,16 +131,22 @@ class ProcessPagination:
     """Process a pagination
     """
     def __init__(self, baseurl: str, destination: str, images_dir: str=None,
-                 session: requests.Session=None, max_workers: int=None):
+                 session: requests.Session=None, max_workers: int=None,
+                 date_from: date=None, date_to: date=None, limit: int=-1):
         self.baseurl = baseurl
         self.url = baseurl
         self.destination = destination
         self.images_dir = images_dir or os.path.join(destination, "images")
         self.session = session or requests.Session()
+        self.date_from = date_from
+        self.date_to = date_to
+        self.limit = limit
         self.running = True
         self.executor = ThreadPoolExecutor(max_workers)
         self.done = 0
         self.total = 0
+        self.submitted_count = 0
+        self.stop_paging = False
         self.lastdone = JobInfo()
         self.remaining = {}
 
@@ -162,6 +219,13 @@ class ProcessPagination:
         tags = [x.getText() for x in soup.find_all("a", {"rel":"tag"})]
         body = soup.find("div", class_="post-body")
 
+        # Guarantee the date filter even when the listing page didn't expose a
+        # date: the post page itself reliably carries a published timestamp.
+        if self.date_from or self.date_to:
+            pub = extract_published_date(soup)
+            if pub is not None and not self.in_date_range(pub):
+                return True  # in range-terms "handled" (won't retry), but not saved
+
         self.download_images(body, title, post_url)
 
         # TODO: "Flatten" html and/or convert to Markdown
@@ -198,6 +262,39 @@ class ProcessPagination:
 
         del self.remaining[future]
 
+    def limit_reached(self) -> bool:
+        """True once we've submitted the user-requested number of posts."""
+        return self.limit >= 0 and self.submitted_count >= self.limit
+
+    def in_date_range(self, d: date) -> bool:
+        """True if date d falls within the (inclusive) --from/--to window."""
+        if self.date_from and d < self.date_from:
+            return False
+        if self.date_to and d > self.date_to:
+            return False
+        return True
+
+    @staticmethod
+    def _post_container(anchor):
+        """Smallest ancestor of a post-title link that carries a published date
+        while still wrapping only this one post.
+
+        Climbing by date-presence (rather than by class name) keeps this working
+        across Blogger templates, and the single-title guard stops us before we
+        reach a container spanning several posts and pick up a neighbour's date.
+        """
+        node = anchor
+        for _ in range(8):
+            parent = node.parent
+            if parent is None:
+                break
+            node = parent
+            if len(node.select("h3.post-title a")) > 1:
+                break  # crossed into a multi-post container; stop
+            if extract_published_date(node) is not None:
+                return node
+        return None
+
     def process_one_page(self, url):
         """Adds urls from current page to the executor
 
@@ -212,7 +309,26 @@ class ProcessPagination:
         soup = BeautifulSoup(page.content, 'html.parser')
 
         for x in soup.select("h3.post-title a"):
+            if self.limit_reached():
+                break
+
+            # Filter by date at the listing level when the date is available
+            # here (cheaper: avoids fetching out-of-range posts, and lets us
+            # stop paging once we've walked past the start of the window).
+            post_date = extract_published_date(self._post_container(x))
+            if post_date is not None:
+                if self.date_from and post_date < self.date_from:
+                    # Blogger lists newest -> oldest, so everything from here
+                    # on is older than the window: stop after this page.
+                    self.stop_paging = True
+                    continue
+                if self.date_to and post_date > self.date_to:
+                    continue  # too new; keep scanning toward the window
+
             self.submit(x['href'])
+
+        if self.limit_reached() or self.stop_paging:
+            return None
 
         next_page = soup.select("#blog-pager-older-link a")
 
@@ -241,6 +357,7 @@ class ProcessPagination:
         future.add_done_callback(self.process_post_callback)
         self.remaining[future] = JobInfo(url, fname, remaining_tries)
         self.total += 1
+        self.submitted_count += 1
 
     def resubmit(self, ji: JobInfo):
         future = self.executor.submit(self.process_post, ji.url, ji.fname)
@@ -353,8 +470,31 @@ def main():
         action='store_true',
         help="Open a browser to log into Google before crawling (for private blogs)"
     )
+    parser.add_argument('--from', '--start-date',
+        dest='date_from',
+        type=parse_cli_date,
+        default=None,
+        metavar='YYYY-MM-DD',
+        help="Only download posts published on or after this date"
+    )
+    parser.add_argument('--to', '--end-date',
+        dest='date_to',
+        type=parse_cli_date,
+        default=None,
+        metavar='YYYY-MM-DD',
+        help="Only download posts published on or before this date"
+    )
+    parser.add_argument('-n', '--limit',
+        dest='limit',
+        type=int,
+        default=-1,
+        help="Max number of posts to crawl (-1 = all posts within the date range)"
+    )
 
     args = parser.parse_args()
+
+    if args.date_from and args.date_to and args.date_from > args.date_to:
+        parser.error("--from date must not be later than --to date")
 
     session = login_session(args.url) if args.login else None
 
@@ -363,7 +503,10 @@ def main():
         destination=args.destination,
         images_dir=args.images_dir,
         session=session,
-        max_workers=args.threads)
+        max_workers=args.threads,
+        date_from=args.date_from,
+        date_to=args.date_to,
+        limit=args.limit)
 
     def signal_handler(sig, frame):
         # TODO: Add 5 seconds timeout or something like
