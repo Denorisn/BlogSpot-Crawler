@@ -1,0 +1,7 @@
+# Core crawling
+requests>=2.28
+beautifulsoup4>=4.11
+
+# Optional: only needed for --login (private, Google-gated blogs).
+# After installing, also run:  playwright install chromium
+playwright>=1.40
