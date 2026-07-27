@@ -152,13 +152,16 @@ class ProcessPagination:
         # Create the images folder up front so worker threads don't race on it.
         os.makedirs(self.images_dir, exist_ok=True)
 
-    def download_images(self, body: Tag, title: str, post_url: str):
+    def download_images(self, body: Tag, title: str, post_url: str, post_date: date=None):
         """Downloads the full-size version of every image in a post body.
 
         Images are saved to the flat images folder, named after the post title.
         A post with more than one image gets numbered suffixes ("Title_1.jpg",
         "Title_2.jpg", ...). Names are deterministic, so re-runs skip files that
         already exist. Failures on a single image are logged, not fatal.
+
+        When post_date is given, each saved image file's access/modified time is
+        set to the post's date so archives sort by publication date.
         """
         imgs = body.find_all("img") if body else []
 
@@ -199,6 +202,9 @@ class ProcessPagination:
                     continue
                 with open(path, "wb") as imgf:
                     imgf.write(resp.content)
+                if post_date is not None:
+                    ts = time.mktime(post_date.timetuple())
+                    os.utime(path, (ts, ts))
             except Exception as exc:
                 print(f"\nFailed to download image {url}: {exc}")
 
@@ -218,14 +224,15 @@ class ProcessPagination:
         tags = [x.getText() for x in soup.find_all("a", {"rel":"tag"})]
         body = soup.find("div", class_="post-body")
 
-        # Guarantee the date filter even when the listing page didn't expose a
-        # date: the post page itself reliably carries a published timestamp.
-        if self.date_from or self.date_to:
-            pub = extract_published_date(soup)
-            if pub is not None and not self.in_date_range(pub):
-                return True  # in range-terms "handled" (won't retry), but not saved
+        # The post page reliably carries a published date; use it both to
+        # guarantee the date filter (even when the listing page hid the date)
+        # and to stamp downloaded image files with the post's date.
+        pub = extract_published_date(soup)
+        if (self.date_from or self.date_to) and pub is not None \
+                and not self.in_date_range(pub):
+            return True  # in range-terms "handled" (won't retry), but not saved
 
-        self.download_images(body, title, post_url)
+        self.download_images(body, title, post_url, pub)
 
         # TODO: "Flatten" html and/or convert to Markdown
 
@@ -236,6 +243,12 @@ class ProcessPagination:
             print("tags:", "[" + ",".join(tags) + "]", file=f)
             print("---", file=f)
             print(body, file=f)
+
+        # Stamp the post file with the post's date so it sorts alongside its
+        # images by publication date.
+        if pub is not None:
+            ts = time.mktime(pub.timetuple())
+            os.utime(fname, (ts, ts))
 
         return True
 
