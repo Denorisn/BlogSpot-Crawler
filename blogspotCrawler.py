@@ -18,7 +18,6 @@ import requests
 from bs4 import BeautifulSoup, Tag
 
 REMAINING_FILE = "~/.config/scripts/PyBloggerRemaining.txt"
-LOGIN_PROFILE = "~/.config/scripts/blogcrawl_profile"
 
 # Hosts Blogger serves post images from.
 IMAGE_HOSTS = ("bp.blogspot.com", "blogger.googleusercontent.com", "googleusercontent.com")
@@ -406,39 +405,46 @@ class ProcessPagination:
         self.executor.shutdown(wait=True, cancel_futures=True)
         self.write_remaining()
 
-def login_session(url: str) -> requests.Session:
-    """Opens a headful browser so the user can log into Google, then returns a
-    requests.Session carrying the authenticated cookies.
+def login_session(browser: str = "firefox", cookie_file: str = None) -> requests.Session:
+    """Builds a requests.Session pre-loaded with cookies from a local browser.
 
-    Playwright is imported lazily so it is only needed when --login is used. A
-    persistent profile is kept under LOGIN_PROFILE, so once you've logged in a
-    later run may already be authenticated (just close the window / press Enter).
+    Rather than automating a Google login (which Google blocks as an insecure /
+    automated browser), we reuse the cookies from a browser you've already logged
+    into. Firefox is the default and the most reliable cross-platform source:
+    browser_cookie3 locates its profile automatically on Windows and Linux, and
+    Firefox isn't affected by Chrome's on-disk cookie encryption.
+
+    Log into the target blog in that browser first, then run with --login. Pass
+    --cookie-file to point at a specific cookies database (e.g. a Firefox profile
+    copied over from another machine).
     """
     try:
-        from playwright.sync_api import sync_playwright
+        import browser_cookie3
     except ImportError:
-        print("Playwright is required for --login. Install it with:\n"
-              "    pip install playwright\n"
-              "    playwright install chromium", file=sys.stderr)
+        print("browser_cookie3 is required for --login. Install it with:\n"
+              "    pip install browser_cookie3", file=sys.stderr)
         sys.exit(1)
 
-    profile_dir = os.path.expanduser(LOGIN_PROFILE)
-    os.makedirs(profile_dir, exist_ok=True)
+    loader = getattr(browser_cookie3, browser, None)
+    if loader is None:
+        print(f"Unsupported browser '{browser}'. Try: firefox, chrome, edge.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        # No domain filter: we load every cookie so both the Google auth cookies
+        # (.google.com) and the blog's own cookies (.blogspot.com) come along;
+        # requests only sends the ones matching each request's host.
+        jar = loader(cookie_file=cookie_file) if cookie_file else loader()
+    except Exception as exc:
+        print(f"Could not read {browser} cookies: {exc}\n"
+              "Make sure the browser is installed, you're logged into the blog, "
+              "and (on some systems) that the browser is closed.", file=sys.stderr)
+        sys.exit(1)
 
     session = requests.Session()
-    with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(profile_dir, headless=False)
-        page = context.new_page() if not context.pages else context.pages[0]
-        page.goto(url)
-        print("\nA browser window has opened. Log into your Google account and "
-              "make sure the blog is visible,\nthen press Enter here to continue...")
-        input()
-
-        for c in context.cookies():
-            session.cookies.set(c["name"], c["value"],
-                                domain=c.get("domain"), path=c.get("path", "/"))
-        context.close()
-
+    session.cookies.update(jar)
+    print(f"Loaded {len(session.cookies)} cookies from {browser}.")
     return session
 
 
@@ -468,7 +474,24 @@ def main():
     parser.add_argument('--login',
         dest='login',
         action='store_true',
-        help="Open a browser to log into Google before crawling (for private blogs)"
+        help="Reuse cookies from a local browser for private/login-gated blogs "
+             "(log into the blog in that browser first)"
+    )
+    parser.add_argument('--browser',
+        dest='browser',
+        type=str,
+        default='firefox',
+        choices=['firefox', 'chrome', 'edge', 'brave', 'chromium', 'opera', 'vivaldi'],
+        help="Browser to read cookies from when using --login (default: firefox). "
+             "Note: on Windows, recent Chrome/Edge versions encrypt their cookie "
+             "store and may fail to read — use --cookie-file or firefox if so."
+    )
+    parser.add_argument('--cookie-file',
+        dest='cookie_file',
+        type=str,
+        default=None,
+        help="Path to a specific cookies database for --login "
+             "(e.g. a Firefox cookies.sqlite copied from another machine)"
     )
     parser.add_argument('--from', '--start-date',
         dest='date_from',
@@ -496,7 +519,7 @@ def main():
     if args.date_from and args.date_to and args.date_from > args.date_to:
         parser.error("--from date must not be later than --to date")
 
-    session = login_session(args.url) if args.login else None
+    session = login_session(args.browser, args.cookie_file) if args.login else None
 
     process_pagination = ProcessPagination(
         baseurl=args.url,

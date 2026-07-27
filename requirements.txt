@@ -2,6 +2,7 @@
 requests>=2.28
 beautifulsoup4>=4.11
 
-# Optional: only needed for --login (private, Google-gated blogs).
-# After installing, also run:  playwright install chromium
-playwright>=1.40
+# Optional: only needed for --login (private / login-gated blogs).
+# Reads cookies from a browser you've already logged the blog into.
+# Firefox is the default and most reliable source on Windows and Linux.
+browser_cookie3>=0.19
