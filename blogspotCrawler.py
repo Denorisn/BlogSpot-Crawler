@@ -466,22 +466,22 @@ def main():
     parser = argparse.ArgumentParser(description="Blogspot crawler",
         epilog="(C) David Davó - https://ddavo.me. Licensed under a MIT License.")
     parser.add_argument('url', type=str, help='Blog url')
-    parser.add_argument('-o', '--output',
+    parser.add_argument('--output',
         dest='destination',
         type=str, 
         default="./",
         help="Output folder"
     )
-    parser.add_argument('-t', '--threads',
+    parser.add_argument('--threads',
         dest='threads',
         type=int,
-        default=None,
+        default=1,
         help="Number of threads"
     )
-    parser.add_argument('-i', '--images-dir',
+    parser.add_argument('--images-dir',
         dest='images_dir',
         type=str,
-        default=None,
+        default="./images",
         help="Folder to save full-size images to (default: <output>/images)"
     )
     parser.add_argument('--login',
@@ -509,18 +509,18 @@ def main():
     parser.add_argument('--from', '--start-date',
         dest='date_from',
         type=parse_cli_date,
-        default=None,
+        default='2000-01-01',
         metavar='YYYY-MM-DD',
         help="Only download posts published on or after this date"
     )
     parser.add_argument('--to', '--end-date',
         dest='date_to',
         type=parse_cli_date,
-        default=None,
+        default='2030-01-01',
         metavar='YYYY-MM-DD',
         help="Only download posts published on or before this date"
     )
-    parser.add_argument('-n', '--limit',
+    parser.add_argument('--limit',
         dest='limit',
         type=int,
         default=-1,
