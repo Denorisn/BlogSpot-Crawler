@@ -6,6 +6,7 @@ import os.path
 import errno
 import time
 import re
+import threading
 import mimetypes
 from datetime import date
 from urllib.parse import urlparse, urljoin
@@ -118,6 +119,16 @@ def parse_cli_date(value: str) -> date:
             f"invalid date '{value}', expected YYYY-MM-DD")
 
 
+def parse_tag_list(value: str) -> set:
+    """argparse type: 'a,b,c' -> {'a','b','c'} (lower-cased, blanks dropped).
+
+    Tags are matched case-insensitively, so we normalise to lower case here.
+    """
+    if not value:
+        return set()
+    return {t.strip().lower() for t in value.split(',') if t.strip()}
+
+
 @dataclass
 class JobInfo:
     """Saves info from a job
@@ -132,7 +143,8 @@ class ProcessPagination:
     def __init__(self, baseurl: str, destination: str, images_dir: str=None,
                  session: requests.Session=None, max_workers: int=None,
                  date_from: date=None, date_to: date=None, limit: int=-1,
-                 downloadhtml: bool = False, downloadImages: bool=False
+                 downloadhtml: bool = False, downloadImages: bool=False,
+                 tags: set=None, exclude_tags: set=None, match_any: bool=False
                  ):
         self.baseurl = baseurl
         self.url = baseurl
@@ -142,11 +154,15 @@ class ProcessPagination:
         self.date_from = date_from
         self.date_to = date_to
         self.limit = limit
+        self.tags = tags or set()
+        self.exclude_tags = exclude_tags or set()
+        self.match_any = match_any
         self.running = True
         self.executor = ThreadPoolExecutor(max_workers)
         self.done = 0
         self.total = 0
-        self.submitted_count = 0
+        self.saved_count = 0
+        self.count_lock = threading.Lock()
         self.stop_paging = False
         self.lastdone = JobInfo()
         self.remaining = {}
@@ -215,7 +231,7 @@ class ProcessPagination:
     def response_to_file(self, fname, content, post_url):
         soup = BeautifulSoup(content, 'html.parser')
 
-        if not os.path.exists(os.path.dirname(fname)):
+        if self.use_download_html == True and not os.path.exists(os.path.dirname(fname)):
             try:
                 os.makedirs(os.path.dirname(fname))
             except OSError as exc: # Guard against race condition
@@ -236,6 +252,21 @@ class ProcessPagination:
                 and not self.in_date_range(pub):
             return True  # in range-terms "handled" (won't retry), but not saved
 
+        # Skip posts that don't pass the tag filters before downloading anything.
+        if not self.tags_allowed(tags):
+            return True  # "handled" (won't retry), but not saved
+
+        # Reserve a save slot atomically so --limit counts posts actually saved
+        # (after all filters), never merely submitted. Because submission is
+        # concurrent, several workers may reach here at once; the lock ensures we
+        # never save more than the limit, and signals pagination to stop.
+        if self.limit >= 0:
+            with self.count_lock:
+                if self.saved_count >= self.limit:
+                    self.stop_paging = True
+                    return True  # limit already met; skip without downloading
+                self.saved_count += 1
+
         if self.use_download_images == True:
             self.download_images(body, title, post_url, pub)
 
@@ -250,11 +281,11 @@ class ProcessPagination:
                 print("---", file=f)
                 print(body, file=f)
 
-        # Stamp the post file with the post's date so it sorts alongside its
-        # images by publication date.
-        if pub is not None:
-            ts = time.mktime(pub.timetuple())
-            os.utime(fname, (ts, ts))
+            # Stamp the post file with the post's date so it sorts alongside its
+            # images by publication date. Only when the HTML file was written.
+            if pub is not None:
+                ts = time.mktime(pub.timetuple())
+                os.utime(fname, (ts, ts))
 
         return True
 
@@ -271,18 +302,29 @@ class ProcessPagination:
         if future.cancelled():
             return
 
-        if future.result():
-            self.done += 1
-            self.lastdone = self.remaining[future]
-        else:
-            if self.remaining[future].remaining > 0:
-                self.resubmit(self.remaining[future])
+        # future.result() re-raises anything the worker threw (e.g. a network
+        # error): treat that as a failed job rather than letting the exception
+        # escape the callback, which would leave the job stuck in `remaining`.
+        try:
+            ok = future.result()
+        except Exception:
+            ok = False
 
-        del self.remaining[future]
+        ji = self.remaining.pop(future, None)
+        if ok:
+            self.done += 1
+            if ji is not None:
+                self.lastdone = ji
+        elif ji is not None and ji.remaining > 0:
+            self.resubmit(ji)
+
+        # Repaint the status line as each post finishes, so "Done X/Y" advances
+        # live even while the main thread is blocked waiting for a page's jobs.
+        self.printStatus(self.lastdone.url, self.total, self.done)
 
     def limit_reached(self) -> bool:
-        """True once we've submitted the user-requested number of posts."""
-        return self.limit >= 0 and self.submitted_count >= self.limit
+        """True once we've saved the user-requested number of posts."""
+        return self.limit >= 0 and self.saved_count >= self.limit
 
     def in_date_range(self, d: date) -> bool:
         """True if date d falls within the (inclusive) --from/--to window."""
@@ -290,6 +332,26 @@ class ProcessPagination:
             return False
         if self.date_to and d > self.date_to:
             return False
+        return True
+
+    def tags_allowed(self, post_tags) -> bool:
+        """Whether a post passes the tag filters, given its list of tag labels.
+
+        - --exclude-tags: reject the post if it carries ANY excluded tag.
+        - --tags: require the post to carry the included tags. By default it must
+          have them ALL (AND); with --any-tags it needs at least one (OR).
+        Matching is case-insensitive. No filters set -> every post is allowed.
+        """
+        have = {t.strip().lower() for t in post_tags}
+
+        if self.exclude_tags and (have & self.exclude_tags):
+            return False
+
+        if self.tags:
+            if self.match_any:
+                return bool(have & self.tags)
+            return self.tags <= have  # every required tag present
+
         return True
 
     @staticmethod
@@ -327,7 +389,14 @@ class ProcessPagination:
         soup = BeautifulSoup(page.content, 'html.parser')
 
         for x in soup.select("h3.post-title a"):
-            if self.limit_reached():
+            if self.limit_reached() or self.stop_paging:
+                break
+
+            # Throttle submissions: once enough posts are saved-or-in-flight to
+            # possibly reach the limit, stop submitting and let them finish. If
+            # some are then filtered out, the per-page barrier in process() lets
+            # us come back for more, so we neither over-fetch nor under-deliver.
+            if self.limit >= 0 and (self.saved_count + len(self.remaining)) >= self.limit:
                 break
 
             # Filter by date at the listing level when the date is available
@@ -375,7 +444,6 @@ class ProcessPagination:
         future.add_done_callback(self.process_post_callback)
         self.remaining[future] = JobInfo(url, fname, remaining_tries)
         self.total += 1
-        self.submitted_count += 1
 
     def resubmit(self, ji: JobInfo):
         future = self.executor.submit(self.process_post, ji.url, ji.fname)
@@ -409,6 +477,15 @@ class ProcessPagination:
         while self.url and self.running:
             self.printStatus(self.url, self.total, self.done)
             self.url = self.process_one_page(self.url)
+
+            # With a --limit, let this page's jobs finish before fetching the
+            # next listing page, so saved_count reflects them (and the throttle
+            # above can re-evaluate). Otherwise we'd race ahead and fetch every
+            # listing page while workers are still catching up.
+            if self.limit >= 0 and self.running:
+                wait(list(self.remaining.keys()), return_when=ALL_COMPLETED)
+                if self.limit_reached():
+                    break
 
         self.printStatus(self.lastdone.url, self.total, self.done)
         _, not_done = wait(self.remaining.keys(), .5, ALL_COMPLETED)
@@ -544,6 +621,27 @@ def main():
         default=True,
         help="Toggle the ability to download the images for posts"
     )
+    parser.add_argument('--tags',
+        dest='tags',
+        type=parse_tag_list,
+        default=set(),
+        metavar='TAG1,TAG2,...',
+        help="Only download posts carrying these tags (comma-separated). "
+             "By default a post must have ALL of them; see --any-tags."
+    )
+    parser.add_argument('--any-tags',
+        dest='match_any',
+        action='store_true',
+        help="With --tags, match posts that have ANY of the tags (OR) "
+             "instead of ALL of them (AND)"
+    )
+    parser.add_argument('--exclude-tags',
+        dest='exclude_tags',
+        type=parse_tag_list,
+        default=set(),
+        metavar='TAG1,TAG2,...',
+        help="Skip posts carrying any of these tags (comma-separated)"
+    )
 
 
     args = parser.parse_args()
@@ -563,7 +661,10 @@ def main():
         date_to=args.date_to,
         limit=args.limit,
         downloadhtml=args.downloadhtml,
-        downloadImages=args.downloadImages)
+        downloadImages=args.downloadImages,
+        tags=args.tags,
+        exclude_tags=args.exclude_tags,
+        match_any=args.match_any)
 
     def signal_handler(sig, frame):
         # TODO: Add 5 seconds timeout or something like
